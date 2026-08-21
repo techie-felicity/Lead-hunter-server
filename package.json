@@ -1,0 +1,19 @@
+{
+  "name": "leadhunter-server",
+  "version": "1.0.0",
+  "description": "Google Maps scraper server for LeadHunter",
+  "main": "index.js",
+  "scripts": {
+    "start": "npx playwright install chromium --with-deps && node index.js",
+    "dev": "node --watch index.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "cors": "^2.8.5",
+    "playwright": "^1.44.0",
+    "web-push": "^3.6.7"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
