@@ -1,0 +1,965 @@
+const express = require("express");
+const cors = require("cors");
+const path = require("path");
+const crypto = require("crypto");
+const fs = require("fs");
+const { chromium } = require("playwright");
+const webpush = require("web-push");
+
+const app = express();
+const PORT = process.env.PORT || 3001;
+
+app.use(cors({ origin: "*", methods: ["GET", "POST", "OPTIONS"], allowedHeaders: ["Content-Type", "Authorization"] }));
+app.options("*", cors());
+app.use(express.json({ limit: "10mb" }));
+
+// ── VAPID keys for Web Push ───────────────────────────────────────────────────
+// These MUST stay the same across restarts or existing push subscriptions break.
+// Set VAPID_PUBLIC_KEY / VAPID_PRIVATE_KEY / VAPID_SUBJECT as Railway env vars
+// to pin them permanently. Falls back to a generated default otherwise.
+const VAPID_PUBLIC_KEY = process.env.VAPID_PUBLIC_KEY || "BCWKOl5sntMhA-VH_xytcF81-xj_teAO7vdDf2OItEcrIRstktuwJF3sfpg9D4rCMO_L1yptx8msxI7H5_sb3AU";
+const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY || "3ddKt2LoSRlCSZ6r_01UjHq9mHRA-HeDtuRCHYZwfsU";
+const VAPID_SUBJECT = process.env.VAPID_SUBJECT || "mailto:admin@example.com";
+
+if (!process.env.VAPID_PUBLIC_KEY) {
+  console.warn("⚠️  Using default VAPID keys. Set VAPID_PUBLIC_KEY / VAPID_PRIVATE_KEY env vars on Railway to keep push subscriptions valid across redeploys.");
+}
+webpush.setVapidDetails(VAPID_SUBJECT, VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY);
+
+// ── Serve the frontend itself (needs to be a real HTTPS origin for Push API) ──
+app.use(express.static(path.join(__dirname, "public")));
+
+app.get("/health", (req, res) => res.json({ status: "ok" }));
+
+app.get("/diagnostics", async (req, res) => {
+  const result = { chromiumLaunch: null, error: null, nodeVersion: process.version, memory: process.memoryUsage(), containerMemory: getMemoryStatus() };
+  let browser;
+  try {
+    browser = await chromium.launch({
+      headless: true,
+      timeout: 60000,
+      args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--disable-software-rasterizer"],
+    });
+    const version = browser.version();
+    result.chromiumLaunch = "ok";
+    result.chromiumVersion = version;
+  } catch (e) {
+    result.chromiumLaunch = "failed";
+    result.error = e.message;
+  } finally {
+    if (browser) await browser.close().catch(() => {});
+  }
+  res.json(result);
+});
+app.get("/push/vapid-public-key", (req, res) => res.json({ key: VAPID_PUBLIC_KEY }));
+
+// ── Push subscriptions (in-memory; cleared on restart) ───────────────────────
+const pushSubscriptions = new Map(); // endpoint -> subscription object
+
+app.post("/push/subscribe", (req, res) => {
+  const sub = req.body;
+  if (!sub || !sub.endpoint) return res.status(400).json({ error: "invalid subscription" });
+  pushSubscriptions.set(sub.endpoint, sub);
+  res.json({ ok: true });
+});
+
+app.post("/push/unsubscribe", (req, res) => {
+  const { endpoint } = req.body || {};
+  if (endpoint) pushSubscriptions.delete(endpoint);
+  res.json({ ok: true });
+});
+
+async function notifyAll(payload) {
+  const body = JSON.stringify(payload);
+  const dead = [];
+  for (const [endpoint, sub] of pushSubscriptions) {
+    try {
+      await webpush.sendNotification(sub, body);
+    } catch (e) {
+      if (e.statusCode === 404 || e.statusCode === 410) dead.push(endpoint);
+    }
+  }
+  dead.forEach(e => pushSubscriptions.delete(e));
+}
+
+function phoneToWA(phone) {
+  if (!phone) return "";
+  const d = phone.replace(/\D/g, "");
+  const n = d.startsWith("0") ? "234" + d.slice(1) : d;
+  return n.length >= 10 ? `https://wa.me/${n}` : "";
+}
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+// ── Density presets ────────────────────────────────────────────────────────────
+const DENSITY_PRESETS = {
+  light:    { targetPoints: 40 },
+  standard: { targetPoints: 90 },
+  dense:    { targetPoints: 170 },
+};
+
+// ── Geocoding ──────────────────────────────────────────────────────────────────
+function bboxAreaKm2(bbox) {
+  const midLat = (bbox.minLat + bbox.maxLat) / 2;
+  const latKm = (bbox.maxLat - bbox.minLat) * 111;
+  const lonKm = (bbox.maxLon - bbox.minLon) * 111 * Math.cos((midLat * Math.PI) / 180);
+  return Math.max(latKm * lonKm, 0);
+}
+
+async function geocodeLocation(location) {
+  const url = `https://nominatim.openstreetmap.org/search?format=json&limit=8&addressdetails=1&q=${encodeURIComponent(location)}`;
+  const res = await fetch(url, { headers: { "User-Agent": "LeadHunterPro/1.0 (lead-gen scraping tool)" } });
+  if (!res.ok) throw new Error(`Geocoding failed (${res.status})`);
+  const data = await res.json();
+  if (!data || !data.length) throw new Error(`Could not find location "${location}"`);
+
+  const candidates = data.map(hit => {
+    const [minLat, maxLat, minLon, maxLon] = hit.boundingbox.map(Number);
+    const bbox = { minLat, maxLat, minLon, maxLon };
+    return {
+      lat: Number(hit.lat), lon: Number(hit.lon),
+      displayName: hit.display_name, bbox,
+      area: bboxAreaKm2(bbox),
+      isBroadType: hit.class === "boundary" || ["city", "state", "town", "administrative", "county"].includes(hit.type),
+    };
+  });
+
+  const broad = candidates.filter(c => c.isBroadType).sort((a, b) => b.area - a.area);
+  return broad[0] || candidates.sort((a, b) => b.area - a.area)[0];
+}
+
+function buildGrid(bbox, targetPoints) {
+  const { minLat, maxLat, minLon, maxLon } = bbox;
+  const midLat = (minLat + maxLat) / 2;
+  const latSpanKm = (maxLat - minLat) * 111;
+  const lonSpanKm = (maxLon - minLon) * 111 * Math.cos((midLat * Math.PI) / 180);
+  const areaKm2 = Math.max(latSpanKm * lonSpanKm, 1);
+
+  let stepKm = Math.sqrt(areaKm2 / targetPoints);
+  stepKm = Math.max(stepKm, 0.8);
+
+  const latStepDeg = stepKm / 111;
+  const lonStepDeg = stepKm / (111 * Math.cos((midLat * Math.PI) / 180) || 1);
+
+  const points = [];
+  for (let lat = minLat + latStepDeg / 2; lat <= maxLat; lat += latStepDeg) {
+    for (let lon = minLon + lonStepDeg / 2; lon <= maxLon; lon += lonStepDeg) {
+      points.push({ lat, lon });
+    }
+  }
+  const capped = points.length > targetPoints * 2.5 ? points.slice(0, Math.ceil(targetPoints * 2.5)) : points;
+  const zoom = stepKm <= 1.2 ? 16 : stepKm <= 2.2 ? 15 : stepKm <= 4 ? 14 : stepKm <= 7 ? 13 : 12;
+  return { points: capped, stepKm, zoom };
+}
+
+// ── Browser helpers ────────────────────────────────────────────────────────────
+function shortLaunchError(e) {
+  // Playwright bakes the full command line + raw stderr into e.message, which is
+  // useless (and huge) to show a user. Pull out just the actual error line.
+  const msg = e.message || String(e);
+  const dbusLine = /Failed to connect to the bus/i.test(msg);
+  const lines = msg.split("\n").map(l => l.trim()).filter(Boolean);
+  const meaningful = lines.find(l =>
+    /error|failed|denied|enoent|enomem|timeout/i.test(l) &&
+    !/^--|^\[pid=|^<launched>|dbus\/bus\.cc/i.test(l)
+  );
+  if (meaningful) return meaningful.slice(0, 200);
+  if (dbusLine) return "Browser environment issue (dbus) — usually harmless on its own; check Railway logs for the real cause below it.";
+  return lines[0]?.slice(0, 200) || "Browser failed to launch";
+}
+
+async function launchBrowser() {
+  let browser;
+  try {
+    browser = await chromium.launch({
+      headless: true,
+      timeout: 60000,
+      args: [
+        "--no-sandbox", "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage", "--disable-gpu",
+        "--disable-software-rasterizer",
+        "--disable-blink-features=AutomationControlled",
+        "--lang=en-US",
+        "--window-size=1366,900",
+        // We only ever read text/DOM data — images cost real memory/CPU to
+        // fetch and decode with zero scraping value, and Google Maps' result
+        // feed is thumbnail-heavy. Disabling them at the engine level (rather
+        // than intercepting each request in Node, which round-trips through
+        // the JS process for every single one) means they're never fetched
+        // at all — this is the single biggest lever on tab memory/CPU cost,
+        // which is what actually lets concurrency help instead of causing
+        // the Chromium OOM crashes ("Target crashed") seen under load.
+        "--blink-settings=imagesEnabled=false",
+        "--disable-remote-fonts",
+        // Extra flags below don't change what's scraped or how fast a page
+        // loads — they just strip background Chromium subsystems (sync,
+        // extensions, translate, telemetry, throttling timers) that cost
+        // RAM but are never used by a headless scrape. On a container this
+        // tight on memory, shaving Chromium's idle baseline is what buys
+        // back the headroom needed to avoid an OOM kill.
+        "--disable-extensions",
+        "--disable-component-extensions-with-background-pages",
+        "--disable-background-networking",
+        "--disable-sync",
+        "--disable-translate",
+        "--disable-default-apps",
+        "--metrics-recording-only",
+        "--mute-audio",
+        "--no-first-run",
+        "--disable-backgrounding-occluded-windows",
+        "--disable-renderer-backgrounding",
+        "--disable-background-timer-throttling",
+        "--disable-ipc-flooding-protection",
+        "--disable-hang-monitor",
+        "--disable-domain-reliability",
+        "--disable-client-side-phishing-detection",
+        // Fewer isolated renderer processes = less RAM per tab. Safe here
+        // since we don't rely on site-isolation security boundaries for a
+        // scraper visiting one origin (Google Maps / a listing's own site).
+        "--disable-features=IsolateOrigins,site-per-process,TranslateUI",
+        // Caps each renderer's own V8 heap so a single tab can't quietly
+        // balloon — plenty for DOM scraping, which is all these pages do.
+        "--js-flags=--max-old-space-size=256",
+      ],
+    });
+  } catch (e) {
+    console.error("Chromium launch failed — full detail:\n", e.message);
+    throw new Error(`Chromium launch failed: ${shortLaunchError(e)} (see Railway logs for full detail)`);
+  }
+  const context = await browser.newContext({
+    userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    locale: "en-US",
+    viewport: { width: 1366, height: 900 },
+    extraHTTPHeaders: { "Accept-Language": "en-US,en;q=0.9" },
+  });
+  await context.addInitScript(() => {
+    Object.defineProperty(navigator, "webdriver", { get: () => false });
+    window.chrome = { runtime: {} };
+  });
+  // Belt-and-suspenders for video (rare on these pages, cheap to keep as a
+  // route block rather than a launch flag).
+  await context.route("**/*.{mp4,webm}", r => r.abort());
+  return { browser, context };
+}
+
+// Races a promise against a hard deadline. Playwright calls like page.evaluate()
+// or browser.close() have NO built-in timeout in some situations — if the
+// Chromium process is stuck (e.g. under memory pressure) rather than fully
+// crashed, they can hang forever instead of throwing, which stalls the whole
+// job indefinitely with no error ever logged. This turns that silent hang
+// into a normal, catchable timeout error so the job keeps moving.
+function withTimeout(promise, ms, label) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+// Closes a browser with a hard deadline. If close() itself hangs (unresponsive
+// Chromium process), force-kills the underlying process as a last resort so a
+// recycle can never block the job forever.
+async function safeCloseBrowser(browser) {
+  if (!browser) return;
+  try {
+    await withTimeout(browser.close(), 15000, "browser.close");
+  } catch (_) {
+    try {
+      const proc = browser.process && browser.process();
+      if (proc && !proc.killed) proc.kill("SIGKILL");
+    } catch (_) {}
+  }
+}
+
+async function dismissDialogs(page) {
+  for (const txt of ["Accept all", "Accept", "Agree", "Reject all"]) {
+    try {
+      const btn = page.locator(`button:has-text("${txt}")`).first();
+      if (await btn.isVisible({ timeout: 2000 })) { await btn.click(); await sleep(1000); return; }
+    } catch (_) {}
+  }
+}
+
+async function gotoWithRetry(page, url, retries = 2) {
+  for (let i = 0; i < retries; i++) {
+    try {
+      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 40000 });
+      return;
+    } catch (e) {
+      if (i === retries - 1) throw e;
+      await sleep(2500);
+    }
+  }
+}
+
+async function deepScroll(page, cellCap) {
+  try {
+    await page.waitForSelector('a[href*="/maps/place/"]', { timeout: 12000 });
+  } catch (_) {
+    return [];
+  }
+  await sleep(500);
+
+  const feedHandle = await page.evaluateHandle(() => {
+    const selectors = ['div[role="feed"]', '[aria-label*="Results for"]', '[aria-label*="Search results"]', '.m6QErb[aria-label]', '.m6QErb'];
+    for (const sel of selectors) {
+      const el = document.querySelector(sel);
+      if (el && el.scrollHeight > el.clientHeight) return el;
+    }
+    let best = null, bestH = 0;
+    document.querySelectorAll('div').forEach(el => {
+      if (el.scrollHeight > el.clientHeight + 100 && el.scrollHeight > bestH) { best = el; bestH = el.scrollHeight; }
+    });
+    return best;
+  });
+
+  let lastCount = 0, staleRounds = 0;
+  const MAX_STALE = 6;
+
+  while (true) {
+    const count = await page.evaluate(() => new Set(
+      Array.from(document.querySelectorAll('a[href*="/maps/place/"]')).map(a => a.href.split("?")[0])
+    ).size);
+
+    if (count >= cellCap) break;
+
+    if (count === lastCount) {
+      staleRounds++;
+      if (staleRounds >= 3) {
+        const ended = await page.evaluate(() => {
+          const body = document.body.innerText || "";
+          return body.includes("You've reached the end of the list") || body.includes("reached the end") || !!document.querySelector('[class*="PbZDve"]');
+        });
+        if (ended) break;
+      }
+      if (staleRounds >= MAX_STALE) break;
+    } else {
+      staleRounds = 0;
+    }
+    lastCount = count;
+
+    await page.evaluate((el) => { if (el) el.scrollBy(0, 4000); else window.scrollBy(0, 4000); }, feedHandle);
+    await sleep(1000);
+  }
+
+  return await page.evaluate(() => {
+    const seen = new Set();
+    const results = [];
+    document.querySelectorAll('a[href*="/maps/place/"]').forEach(a => {
+      const key = a.href.split("?")[0];
+      if (seen.has(key)) return;
+      seen.add(key);
+
+      let card = a;
+      for (let i = 0; i < 10; i++) {
+        if (!card.parentElement) break;
+        card = card.parentElement;
+        if (card.tagName === 'LI' || (card.getAttribute('role') === 'article')) break;
+      }
+
+      let name = a.getAttribute("aria-label") || "";
+      if (!name) {
+        const h = card.querySelector('h3, h2, [class*="fontHeadline"]');
+        if (h) name = h.textContent.trim();
+      }
+      if (!name) {
+        const lines = (card.innerText || "").split("\n").map(l => l.trim()).filter(l => l.length > 1);
+        name = lines[0] || "";
+      }
+      name = name.replace(/\s+/g, " ").trim();
+      if (!name || name.length < 2) return;
+
+      let address = "";
+      const allText = (card.innerText || "").split("\n").map(l => l.trim()).filter(Boolean);
+      for (let i = 1; i < allText.length; i++) {
+        const line = allText[i];
+        if (/^\d+\.\d+$/.test(line)) continue;
+        if (/^\(\d+\)$/.test(line)) continue;
+        if (line.length < 4) continue;
+        address = line;
+        break;
+      }
+
+      let category = "";
+      const catEl = card.querySelector('[class*="DkEaL"], [class*="category"]');
+      if (catEl) category = catEl.textContent.trim();
+
+      results.push({ name, address, category, mapsUrl: a.href });
+    });
+    return results;
+  });
+}
+
+function placeKey(listing) {
+  try {
+    const decoded = decodeURIComponent(listing.mapsUrl || "");
+    const m = decoded.match(/!1s(0x[0-9a-fA-F]+:0x[0-9a-fA-F]+)/);
+    if (m) return "cid:" + m[1];
+  } catch (_) {}
+  const norm = (s) => (s || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+  return "na:" + norm(listing.name) + "|" + norm(listing.address).slice(0, 30);
+}
+
+const EMAIL_RE = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/;
+const SKIP_EMAIL_DOMAINS = /\.(png|jpg|jpeg|gif|svg|webp|css|js)$/i;
+
+async function getPlacePhone(page, mapsUrl) {
+  try {
+    await gotoWithRetry(page, mapsUrl);
+    await sleep(1100);
+    return await page.evaluate(() => {
+      let phone = "";
+      const telLink = document.querySelector('a[href^="tel:"]');
+      if (telLink) phone = telLink.href.replace("tel:", "").trim();
+      if (!phone) {
+        for (const el of document.querySelectorAll('[aria-label]')) {
+          const lbl = el.getAttribute("aria-label") || "";
+          const m = lbl.match(/(\+?[\d][\d\s\-().]{5,14}[\d])/);
+          if (m) {
+            const digits = m[1].replace(/\D/g, "");
+            if (digits.length >= 7 && digits.length <= 15) { phone = m[1].trim(); break; }
+          }
+        }
+      }
+      if (!phone) {
+        for (const el of document.querySelectorAll('button, [role="button"]')) {
+          const t = (el.textContent || "").trim();
+          if (/^[\+\d][\d\s\-().]{6,14}[\d]$/.test(t)) {
+            const d = t.replace(/\D/g, "");
+            if (d.length >= 7 && d.length <= 15) { phone = t; break; }
+          }
+        }
+      }
+
+      let website = "";
+      const authorityLink = document.querySelector('a[data-item-id="authority"]');
+      if (authorityLink) website = authorityLink.href;
+      if (!website) {
+        for (const el of document.querySelectorAll('a[aria-label]')) {
+          const lbl = el.getAttribute("aria-label") || "";
+          if (/^website:/i.test(lbl) && el.href) { website = el.href; break; }
+        }
+      }
+
+      return { phone, website };
+    });
+  } catch {
+    return { phone: "", website: "" };
+  }
+}
+
+// Visits a business's own website (reusing the caller's page — no separate
+// tab) and looks for a contact email — mailto: links first, then a plain-text
+// email pattern on the page. Best-effort only: failures (site down, blocks
+// bots, no email listed, etc.) just result in an empty string rather than
+// failing the whole lead.
+async function getEmailFromPage(page, website) {
+  if (!website) return "";
+  try {
+    await page.goto(website, { waitUntil: "domcontentloaded", timeout: 15000 });
+    await sleep(400);
+    let email = await page.evaluate((skipRe) => {
+      const mailLink = document.querySelector('a[href^="mailto:"]');
+      if (mailLink) {
+        const addr = mailLink.href.replace("mailto:", "").split("?")[0].trim();
+        if (addr) return addr;
+      }
+      const text = document.body ? document.body.innerText : "";
+      const m = text.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/);
+      return m ? m[0] : "";
+    }, SKIP_EMAIL_DOMAINS.source);
+    if (email && SKIP_EMAIL_DOMAINS.test(email)) email = "";
+
+    // A lot of sites tuck the email away on a /contact page instead of the homepage.
+    if (!email) {
+      try {
+        const contactHref = await page.evaluate(() => {
+          const link = Array.from(document.querySelectorAll("a")).find(a =>
+            /contact/i.test(a.href || "") || /contact us/i.test(a.textContent || "")
+          );
+          return link ? link.href : "";
+        });
+        if (contactHref) {
+          await page.goto(contactHref, { waitUntil: "domcontentloaded", timeout: 12000 });
+          await sleep(400);
+          email = await page.evaluate(() => {
+            const mailLink = document.querySelector('a[href^="mailto:"]');
+            if (mailLink) return mailLink.href.replace("mailto:", "").split("?")[0].trim();
+            const text = document.body ? document.body.innerText : "";
+            const m = text.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/);
+            return m ? m[0] : "";
+          });
+        }
+      } catch (_) {}
+    }
+    return email || "";
+  } catch {
+    return "";
+  }
+}
+
+// ── Job store ──────────────────────────────────────────────────────────────────
+// In-memory. A job keeps running on the server regardless of whether any
+// browser/client is connected — the client just polls for progress and can
+// disconnect/reconnect (or switch apps) freely without affecting the job.
+const jobs = new Map();
+
+function newJob(params) {
+  const id = crypto.randomUUID();
+  const job = {
+    id,
+    status: "running", // running | done | error
+    params,
+    logs: [],       // { msg, ts }
+    results: [],    // listing objects
+    progress: { zonesDone: 0, zonesTotal: 0, uniqueTotal: 0, detailsDone: 0, detailsTotal: 0 },
+    error: null,
+    cancelled: false,
+    createdAt: Date.now(),
+    completedAt: null, // set when status becomes done/error — cleanup is based on this, not createdAt
+  };
+  jobs.set(id, job);
+  return job;
+}
+function jlog(job, msg) { job.logs.push({ msg, ts: Date.now() }); }
+
+// Clean up old jobs to avoid unbounded memory growth. Only finished/errored
+// jobs are ever removed, and only well after they completed — a job that's
+// still running (however long it takes) is never deleted, so results stay
+// available on the server until the client explicitly polls them or the
+// user starts a new search.
+setInterval(() => {
+  const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+  for (const [id, job] of jobs) {
+    if (job.status !== "running" && job.completedAt && job.completedAt < cutoff) {
+      jobs.delete(id);
+    }
+  }
+}, 15 * 60 * 1000);
+
+// ── Memory monitoring ────────────────────────────────────────────────────────
+// The failure-rate backoff below only fires when something throws a catchable
+// error. A full container OOM kill (Railway killing the whole process because
+// it exceeded its memory limit) throws nothing — the process is just gone,
+// which is what wiped out the previous job entirely. That has to be prevented
+// proactively, not reacted to after the fact.
+// Also important: process.memoryUsage() only reports the Node process's own
+// heap/RSS — Chromium runs as separate OS processes that Node's own memory
+// stats never see, so checking that would completely miss the actual memory
+// pressure. What's read here instead is the container's real cgroup memory
+// usage/limit, the same numbers the platform's OOM killer itself acts on.
+function readCgroupMemory() {
+  // cgroup v2 (most current container platforms, including Railway)
+  try {
+    const usage = parseInt(fs.readFileSync("/sys/fs/cgroup/memory.current", "utf8").trim(), 10);
+    const limitRaw = fs.readFileSync("/sys/fs/cgroup/memory.max", "utf8").trim();
+    const limit = limitRaw === "max" ? null : parseInt(limitRaw, 10);
+    if (!isNaN(usage)) return { usageMB: usage / 1048576, limitMB: limit ? limit / 1048576 : null };
+  } catch (_) {}
+  // cgroup v1 fallback
+  try {
+    const usage = parseInt(fs.readFileSync("/sys/fs/cgroup/memory/memory.usage_in_bytes", "utf8").trim(), 10);
+    const limitRaw = parseInt(fs.readFileSync("/sys/fs/cgroup/memory/memory.limit_in_bytes", "utf8").trim(), 10);
+    const limit = limitRaw > 1e15 ? null : limitRaw; // v1 reports a huge sentinel value for "unlimited"
+    if (!isNaN(usage)) return { usageMB: usage / 1048576, limitMB: limit ? limit / 1048576 : null };
+  } catch (_) {}
+  return null;
+}
+
+// If cgroup limits aren't readable for some reason (or the platform reports
+// "unlimited"), MEMORY_LIMIT_MB is the fallback ceiling to throttle against.
+// Set this to whatever your Railway plan's actual memory limit is (visible in
+// the service's Metrics tab) minus a safety margin — e.g. a 512MB plan should
+// probably set MEMORY_LIMIT_MB=420 or so.
+const MEMORY_LIMIT_MB_ENV = process.env.MEMORY_LIMIT_MB ? parseInt(process.env.MEMORY_LIMIT_MB, 10) : null;
+
+function getMemoryStatus() {
+  const cg = readCgroupMemory();
+  if (cg) {
+    const limitMB = MEMORY_LIMIT_MB_ENV || cg.limitMB || 512;
+    return { usageMB: Math.round(cg.usageMB), limitMB: Math.round(limitMB), source: "cgroup" };
+  }
+  const rssMB = process.memoryUsage().rss / 1048576;
+  return { usageMB: Math.round(rssMB), limitMB: Math.round(MEMORY_LIMIT_MB_ENV || 512), source: "rss-fallback (may understate Chromium usage)" };
+}
+
+// ── Concurrency ────────────────────────────────────────────────────────────────
+// Both scanning phases run several pages in parallel within one shared
+// browser (cheap — they're tabs, not separate browser processes) instead of
+// doing everything one page at a time. The right number of parallel tabs
+// depends entirely on the CPU/RAM the host actually has, which isn't
+// something that can be guessed correctly from outside — a fixed number is
+// either too low (leaving speed on the table) or too high (Chromium thrashes,
+// or worse, the whole container gets OOM-killed). So instead of a fixed
+// number, concurrency self-tunes per job: it starts fully serial (1x) so we
+// get a real memory baseline before risking anything, then after every
+// generation only ramps up if BOTH the batch had no failures AND memory
+// usage is comfortably under budget — and drops hard the moment memory
+// usage gets close to the limit, regardless of failure rate, since that's
+// the actual precursor to an OOM kill. ZONE_CONCURRENCY / DETAIL_CONCURRENCY
+// (env vars) act as an upper cap on how high it's allowed to climb even if
+// memory looks fine — raise the cap on a bigger plan, lower it to stay extra
+// conservative.
+const ZONE_CONCURRENCY_MAX = Math.max(1, parseInt(process.env.ZONE_CONCURRENCY || "8", 10));
+const DETAIL_CONCURRENCY_MAX = Math.max(1, parseInt(process.env.DETAIL_CONCURRENCY || "10", 10));
+const ZONE_CONCURRENCY_START = 1;
+const DETAIL_CONCURRENCY_START = 1;
+
+// Called right before opening a new tab in the hot loops — a between-
+// generation check alone can miss a mid-generation spike (several workers
+// opening heavy pages at once right as memory crosses the danger line). This
+// adds real back-pressure: if memory's critically tight, pause briefly and
+// recheck before opening anything else.
+// IMPORTANT: this used to give up after 5 waits (15s) and open the next tab
+// regardless of memory still being critical. Waiting alone never reclaims
+// memory Chromium is already holding — if it's still critical after 15s,
+// it stays critical, and proceeding anyway is exactly what let the
+// container hit the platform's hard OOM kill (visible in the logs as a
+// long run of "Memory tight" pauses immediately followed by the job just
+// vanishing — Railway killed the whole process, not something catchable).
+// Now, if it's still critical after waiting, we force a real recycle
+// (kill the browser, launch a fresh one) via the caller-supplied `recycle`
+// callback instead of opening another tab into an already-full container.
+// `job._recycling` guards against concurrent workers all recycling (or
+// grabbing a tab from a context mid-teardown) at once — only the first
+// worker to hit this does it, the rest just wait for it to finish.
+async function waitForMemoryHeadroom(job, label, recycle) {
+  for (let i = 0; i < 5; i++) {
+    const mem = getMemoryStatus();
+    if (mem.usageMB / mem.limitMB < 0.9) return;
+    jlog(job, `   ⏸️ Memory tight (${mem.usageMB}MB/${mem.limitMB}MB) — pausing before opening another ${label} tab…`);
+    await sleep(3000);
+  }
+  const mem = getMemoryStatus();
+  if (mem.usageMB / mem.limitMB < 0.9 || !recycle) return;
+
+  if (job._recycling) {
+    while (job._recycling) await sleep(500);
+    return;
+  }
+  job._recycling = true;
+  try {
+    jlog(job, `   🚨 Memory still critical (${mem.usageMB}MB/${mem.limitMB}MB) after waiting — forcing an emergency browser recycle to free it…`);
+    await recycle();
+  } finally {
+    job._recycling = false;
+  }
+}
+
+function adjustConcurrency(current, max, failRate, label, job) {
+  const mem = getMemoryStatus();
+  const memRatio = mem.usageMB / mem.limitMB;
+  jlog(job, `   🧠 Memory: ${mem.usageMB}MB / ${mem.limitMB}MB budget (${Math.round(memRatio * 100)}%)`);
+
+  if (memRatio > 0.85) {
+    if (current > 1) jlog(job, `   🚨 Memory critical — dropping ${label} concurrency to 1x to avoid a container OOM kill.`);
+    return 1;
+  }
+  if (failRate > 0.3 && current > 1) {
+    const next = Math.max(1, Math.ceil(current / 2));
+    if (next < current) jlog(job, `   ⚙️ High failure rate (${Math.round(failRate * 100)}%) on ${label} — backing off to ${next}x concurrency.`);
+    return next;
+  }
+  if (failRate === 0 && memRatio < 0.6 && current < max) {
+    const next = current + 1;
+    jlog(job, `   ⚙️ Clean batch, memory comfortable — raising ${label} concurrency to ${next}x.`);
+    return next;
+  }
+  return current;
+}
+
+// Fixed generation size (independent of concurrency, since concurrency now
+// changes over the course of a job) — how many zones/listings to process
+// before recycling the browser, to keep memory from building up.
+const ZONES_PER_GENERATION = 24;
+const DETAILS_PER_GENERATION = 60;
+
+// Runs `worker(item)` over `items` with at most `concurrency` running at once,
+// pulling from a shared cursor so a fast worker immediately picks up the next
+// item instead of waiting for a fixed-size batch to fully finish.
+async function runPool(items, concurrency, worker) {
+  let cursor = 0;
+  async function lane() {
+    while (cursor < items.length) {
+      const i = cursor++;
+      await worker(items[i], i);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, lane));
+}
+
+async function runScrapeJob(job) {
+  const { searchTerm, location, density, maxResults, fetchDetails } = job.params;
+  let browser;
+  try {
+    const preset = DENSITY_PRESETS[density] || DENSITY_PRESETS.standard;
+    let gridPoints = [{ lat: null, lon: null }];
+    let zoom = null;
+
+    if (location) {
+      jlog(job, `📍 Locating "${location}"…`);
+      try {
+        const geo = await geocodeLocation(location);
+        const grid = buildGrid(geo.bbox, preset.targetPoints);
+        gridPoints = grid.points;
+        zoom = grid.zoom;
+        jlog(job, `✅ Found: ${geo.displayName} (~${Math.round(geo.area).toLocaleString()} km²)`);
+        jlog(job, `🗺️ Covering the area with ${gridPoints.length} search zones (~${grid.stepKm.toFixed(1)}km spacing, zoom ${zoom}z).`);
+      } catch (e) {
+        jlog(job, `⚠️ Couldn't geocode "${location}" (${e.message}). Falling back to a single search.`);
+      }
+    } else {
+      jlog(job, `⚠️ No location given — running a single search (capped at ~120 results).`);
+    }
+    job.progress.zonesTotal = gridPoints.length;
+
+    jlog(job, `🚀 Launching browser (starting ${ZONE_CONCURRENCY_START}x parallel zones, self-tuning up to ${ZONE_CONCURRENCY_MAX}x)…`);
+    let { browser: b, context } = await launchBrowser();
+    browser = b;
+
+    const seen = new Map();
+    const cellCap = 130;
+    let zonesCompleted = 0;
+    let zoneConcurrency = ZONE_CONCURRENCY_START;
+
+    // Warm up on a single page first — Google's consent dialog only needs
+    // dismissing once per browser context (it sets a cookie), so handling
+    // zone 0 alone keeps that logic simple before fanning out in parallel.
+    {
+      const warmupPage = await context.newPage();
+      try {
+        const { lat, lon } = gridPoints[0];
+        const searchUrl = lat != null
+          ? `https://www.google.com/maps/search/${encodeURIComponent(searchTerm)}/@${lat},${lon},${zoom}z`
+          : `https://www.google.com/maps/search/${encodeURIComponent(searchTerm + (location ? " in " + location : ""))}`;
+        await gotoWithRetry(warmupPage, searchUrl);
+        await sleep(1200);
+        await dismissDialogs(warmupPage);
+        const listings = await deepScroll(warmupPage, cellCap);
+        let added = 0;
+        for (const l of listings) { const key = placeKey(l); if (!seen.has(key)) { seen.set(key, l); added++; } }
+        zonesCompleted = 1;
+        job.progress.zonesDone = zonesCompleted;
+        job.progress.uniqueTotal = seen.size;
+        jlog(job, `   🔎 Zone 1/${gridPoints.length}: ${listings.length} found, ${added} new · total unique: ${seen.size}`);
+      } catch (e) {
+        zonesCompleted = 1;
+        job.progress.zonesDone = zonesCompleted;
+        jlog(job, `   ⚠️ Zone 1/${gridPoints.length} failed (${e.message}) — skipping.`);
+      } finally {
+        await withTimeout(warmupPage.close(), 5000, "page.close").catch(() => {});
+      }
+    }
+
+    // Remaining zones run zoneConcurrency-at-a-time in tabs sharing one
+    // browser, processed in generations so the browser can still be recycled
+    // periodically for memory, and so concurrency can adapt between batches.
+    let zi = 1;
+    while (zi < gridPoints.length && !job.cancelled && seen.size < maxResults) {
+      const genEnd = Math.min(zi + ZONES_PER_GENERATION, gridPoints.length);
+      const genPoints = gridPoints.slice(zi, genEnd);
+      const genOffset = zi;
+      let genFailed = 0;
+
+      await runPool(genPoints, zoneConcurrency, async (pt, localIdx) => {
+        if (job.cancelled || seen.size >= maxResults) return;
+        const globalIdx = genOffset + localIdx;
+        const searchUrl = pt.lat != null
+          ? `https://www.google.com/maps/search/${encodeURIComponent(searchTerm)}/@${pt.lat},${pt.lon},${zoom}z`
+          : `https://www.google.com/maps/search/${encodeURIComponent(searchTerm + (location ? " in " + location : ""))}`;
+        await waitForMemoryHeadroom(job, "zone", async () => {
+          await safeCloseBrowser(browser);
+          ({ browser: b, context } = await launchBrowser());
+          browser = b;
+        });
+        const zonePage = await context.newPage();
+        try {
+          await gotoWithRetry(zonePage, searchUrl);
+          await sleep(900);
+          const listings = await deepScroll(zonePage, cellCap);
+          let added = 0;
+          for (const l of listings) {
+            const key = placeKey(l);
+            if (!seen.has(key)) { seen.set(key, l); added++; }
+          }
+          zonesCompleted++;
+          job.progress.zonesDone = zonesCompleted;
+          job.progress.uniqueTotal = seen.size;
+          jlog(job, `   🔎 Zone ${globalIdx + 1}/${gridPoints.length}: ${listings.length} found, ${added} new · total unique: ${seen.size}`);
+        } catch (e) {
+          genFailed++;
+          zonesCompleted++;
+          job.progress.zonesDone = zonesCompleted;
+          jlog(job, `   ⚠️ Zone ${globalIdx + 1}/${gridPoints.length} failed (${e.message}) — skipping.`);
+        } finally {
+          await withTimeout(zonePage.close(), 5000, "page.close").catch(() => {});
+        }
+        await sleep(200 + Math.random() * 300);
+      });
+
+      zoneConcurrency = adjustConcurrency(zoneConcurrency, ZONE_CONCURRENCY_MAX, genPoints.length ? genFailed / genPoints.length : 0, "zone", job);
+      zi = genEnd;
+
+      // Recycle the browser between generations — a session held open across
+      // hundreds of zones slowly leaks memory until new launches start timing
+      // out. This keeps memory bounded without giving up the parallelism.
+      if (zi < gridPoints.length && !job.cancelled && seen.size < maxResults) {
+        jlog(job, `   🔄 Recycling browser (${zi}/${gridPoints.length} zones done)…`);
+        await safeCloseBrowser(browser);
+        ({ browser: b, context } = await launchBrowser());
+        browser = b;
+      }
+    }
+    if (job.cancelled) jlog(job, `🛑 Cancelled — stopping.`);
+    else if (seen.size >= maxResults) jlog(job, `🎯 Reached target of ${maxResults} — stopping early.`);
+
+    const allListings = Array.from(seen.values());
+    jlog(job, `✅ Coverage complete — ${allListings.length} unique listings found.`);
+
+    if (allListings.length === 0) {
+      jlog(job, `⚠️ No results. Google may have shown a CAPTCHA, or the search returned nothing.`);
+      job.status = "done";
+      job.completedAt = Date.now();
+      await notifyAll({ title: "LeadHunter Pro", body: `Search finished — 0 leads found for "${searchTerm}".`, jobId: job.id });
+      return;
+    }
+
+    if (fetchDetails && !job.cancelled) {
+      jlog(job, `📞 Fetching phone, website & email for ${allListings.length} places (starting ${DETAIL_CONCURRENCY_START}x parallel, self-tuning up to ${DETAIL_CONCURRENCY_MAX}x)…`);
+      job.progress.detailsTotal = allListings.length;
+      let withPhone = 0, withWebsite = 0, withEmail = 0, detailsCompleted = 0;
+      let detailConcurrency = DETAIL_CONCURRENCY_START;
+
+      let di = 0;
+      while (di < allListings.length && !job.cancelled) {
+        const genEnd = Math.min(di + DETAILS_PER_GENERATION, allListings.length);
+        const genItems = allListings.slice(di, genEnd);
+        let genFailed = 0;
+
+        await runPool(genItems, detailConcurrency, async (listing) => {
+          if (job.cancelled) return;
+          await waitForMemoryHeadroom(job, "detail", async () => {
+            await safeCloseBrowser(browser);
+            ({ browser: b, context } = await launchBrowser());
+            browser = b;
+          });
+          let currentPage = await context.newPage();
+          let phone = "", website = "", email = "";
+          try {
+            const d = await withTimeout(getPlacePhone(currentPage, listing.mapsUrl), 60000, "getPlacePhone");
+            phone = d.phone || "";
+            website = d.website || "";
+          } catch (e) {
+            genFailed++;
+            jlog(job, `   ⏱️ Skipped phone/website for "${listing.name}" (${e.message})`);
+            // The page may still be wedged mid-navigation — swap in a fresh
+            // one (best-effort close, never block on it) so the hang can't
+            // carry over into the next listing this worker picks up.
+            await withTimeout(currentPage.close(), 5000, "page.close").catch(() => {});
+            try { currentPage = await context.newPage(); } catch (_) {}
+          }
+          if (website) {
+            try { email = await withTimeout(getEmailFromPage(currentPage, website), 25000, "getEmailFromWebsite"); } catch (_) {}
+          }
+          await withTimeout(currentPage.close(), 5000, "page.close").catch(() => {});
+
+          if (phone) withPhone++;
+          if (website) withWebsite++;
+          if (email) withEmail++;
+          job.results.push({
+            name: listing.name, address: listing.address, category: listing.category,
+            phone, whatsapp: phoneToWA(phone), website, email, mapsUrl: listing.mapsUrl,
+          });
+          detailsCompleted++;
+          job.progress.detailsDone = detailsCompleted;
+          if (detailsCompleted % 25 === 0) jlog(job, `   📋 ${detailsCompleted}/${allListings.length} · ${withPhone} phones · ${withWebsite} websites · ${withEmail} emails`);
+          await sleep(100 + Math.random() * 100);
+        });
+
+        detailConcurrency = adjustConcurrency(detailConcurrency, DETAIL_CONCURRENCY_MAX, genItems.length ? genFailed / genItems.length : 0, "detail", job);
+        di = genEnd;
+
+        if (di < allListings.length && !job.cancelled) {
+          jlog(job, `   🔄 Recycling browser (${di}/${allListings.length} details done)…`);
+          await safeCloseBrowser(browser);
+          ({ browser: b, context } = await launchBrowser());
+          browser = b;
+        }
+      }
+      if (job.cancelled) jlog(job, `🛑 Cancelled — stopping contact lookups.`);
+      jlog(job, `✅ Done — ${allListings.length} total · ${withPhone} with phone · ${withWebsite} with website · ${withEmail} with email`);
+    } else {
+      job.results.push(...allListings.map(l => ({ ...l, phone: "", whatsapp: "", website: "", email: "" })));
+    }
+
+    job.status = "done";
+    job.completedAt = Date.now();
+    await notifyAll({
+      title: "LeadHunter Pro — Results Ready 🎯",
+      body: `${job.results.length} leads found for "${searchTerm}"${location ? " in " + location : ""}.`,
+      jobId: job.id,
+    });
+
+  } catch (err) {
+    const shortMsg = (err.message || String(err)).split("\n")[0].slice(0, 250);
+    job.status = "error";
+    job.error = shortMsg;
+    job.completedAt = Date.now();
+    console.error("Job failed — full detail:\n", err.message);
+    jlog(job, `❌ Error: ${shortMsg}`);
+    await notifyAll({ title: "LeadHunter Pro", body: `Search failed: ${shortMsg}`, jobId: job.id });
+  } finally {
+    if (browser) await safeCloseBrowser(browser);
+  }
+}
+
+// ── API: start a job, poll its status ─────────────────────────────────────────
+app.post("/scrape/start", (req, res) => {
+  let { query = "", searchTerm = "", location = "", maxResults = 5000, fetchDetails = true, density = "standard" } = req.body;
+
+  if ((!searchTerm || !location) && query) {
+    const m = query.match(/^(.+?)\s+(?:in|near|around)\s+(.+)$/i);
+    if (m) { searchTerm = searchTerm || m[1].trim(); location = location || m[2].trim(); }
+    else { searchTerm = searchTerm || query; }
+  }
+  if (!searchTerm) return res.status(400).json({ error: "searchTerm (or query) is required" });
+
+  // Starting a fresh job means whatever the previous job collected is no
+  // longer needed — clear it out of server memory now instead of waiting
+  // for the 24h cleanup sweep, so nothing from an old search lingers once
+  // a new one has begun. A job that's still actively running is left
+  // alone (never deleted mid-flight) — only finished/errored ones are
+  // purged, and only at the moment a new job actually starts.
+  for (const [id, oldJob] of jobs) {
+    if (oldJob.status !== "running") jobs.delete(id);
+  }
+
+  const job = newJob({ searchTerm, location, density, maxResults, fetchDetails });
+  runScrapeJob(job); // fire-and-forget — keeps running even if nobody polls it
+  res.json({ jobId: job.id });
+});
+
+app.get("/scrape/status/:id", (req, res) => {
+  const job = jobs.get(req.params.id);
+  if (!job) return res.status(404).json({ error: "job not found" });
+
+  const sinceLog = parseInt(req.query.sinceLog || "0", 10);
+  const sinceResult = parseInt(req.query.sinceResult || "0", 10);
+
+  res.json({
+    status: job.status,
+    error: job.error,
+    progress: job.progress,
+    newLogs: job.logs.slice(sinceLog).map(l => l.msg),
+    logCount: job.logs.length,
+    newResults: job.results.slice(sinceResult),
+    resultCount: job.results.length,
+  });
+});
+
+app.post("/scrape/cancel/:id", (req, res) => {
+  const job = jobs.get(req.params.id);
+  if (job && job.status === "running") job.cancelled = true;
+  res.json({ ok: true });
+});
+
+app.listen(PORT, () => console.log(`LeadHunter server on port ${PORT}`));
